@@ -26,6 +26,8 @@ import os
 import random
 import sys
 from io import open
+import boto3
+import tarfile
 
 import numpy as np
 import torch
@@ -42,9 +44,6 @@ from optimization import BertAdam, warmup_linear
 from tokenization import (BasicTokenizer, BertTokenizer, whitespace_tokenize)
 from utils import is_main_process, format_step
 import dllogger, time
-
-torch._C._jit_set_profiling_mode(False)
-torch._C._jit_set_profiling_executor(False)
 
 if sys.version_info[0] == 2:
     import cPickle as pickle
@@ -324,6 +323,30 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
             if is_training and example.is_impossible:
                 start_position = 0
                 end_position = 0
+            if example_index < 20:
+                logger.info("*** Example ***")
+                logger.info("unique_id: %s" % (unique_id))
+                logger.info("example_index: %s" % (example_index))
+                logger.info("doc_span_index: %s" % (doc_span_index))
+                logger.info("tokens: %s" % " ".join(tokens))
+                logger.info("token_to_orig_map: %s" % " ".join([
+                    "%d:%d" % (x, y) for (x, y) in token_to_orig_map.items()]))
+                logger.info("token_is_max_context: %s" % " ".join([
+                    "%d:%s" % (x, y) for (x, y) in token_is_max_context.items()
+                ]))
+                logger.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
+                logger.info(
+                    "input_mask: %s" % " ".join([str(x) for x in input_mask]))
+                logger.info(
+                    "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
+                if is_training and example.is_impossible:
+                    logger.info("impossible example")
+                if is_training and not example.is_impossible:
+                    answer_text = " ".join(tokens[start_position:(end_position + 1)])
+                    logger.info("start_position: %d" % (start_position))
+                    logger.info("end_position: %d" % (end_position))
+                    logger.info(
+                        "answer: %s" % (answer_text))
 
             features.append(
                 InputFeatures(
@@ -422,143 +445,197 @@ RawResult = collections.namedtuple("RawResult",
                                    ["unique_id", "start_logits", "end_logits"])
 
 
-def get_answers(examples, features, results, args):
-    predictions = collections.defaultdict(list) #it is possible that one example corresponds to multiple features
-    Prediction = collections.namedtuple('Prediction', ['text', 'start_logit', 'end_logit'])
+def write_predictions(all_examples, all_features, all_results, n_best_size,
+                      max_answer_length, do_lower_case, output_prediction_file,
+                      output_nbest_file, output_null_log_odds_file, verbose_logging,
+                      version_2_with_negative, null_score_diff_threshold):
+    """Write final predictions to the json file and log-odds of null if needed."""
+    logger.info("Writing predictions to: %s" % (output_prediction_file))
+    logger.info("Writing nbest to: %s" % (output_nbest_file))
 
-    if args.version_2_with_negative:
-        null_vals = collections.defaultdict(lambda: (float("inf"),0,0))
-    for ex, feat, result in match_results(examples, features, results):
-        start_indices = _get_best_indices(result.start_logits, args.n_best_size)
-        end_indices = _get_best_indices(result.end_logits, args.n_best_size)
-        prelim_predictions = get_valid_prelim_predictions(start_indices, end_indices, feat, result, args)
+    example_index_to_features = collections.defaultdict(list)
+    for feature in all_features:
+        example_index_to_features[feature.example_index].append(feature)
+
+    unique_id_to_result = {}
+    for result in all_results:
+        unique_id_to_result[result.unique_id] = result
+
+    _PrelimPrediction = collections.namedtuple(  # pylint: disable=invalid-name
+        "PrelimPrediction",
+        ["feature_index", "start_index", "end_index", "start_logit", "end_logit"])
+
+    all_predictions = collections.OrderedDict()
+    all_nbest_json = collections.OrderedDict()
+    scores_diff_json = collections.OrderedDict()
+
+    for (example_index, example) in enumerate(all_examples):
+        features = example_index_to_features[example_index]
+
+        prelim_predictions = []
+        # keep track of the minimum score of null start+end of position 0
+        score_null = 1000000  # large and positive
+        min_null_feature_index = 0  # the paragraph slice with min mull score
+        null_start_logit = 0  # the start logit at the slice with min null score
+        null_end_logit = 0  # the end logit at the slice with min null score
+        for (feature_index, feature) in enumerate(features):
+            result = unique_id_to_result[feature.unique_id]
+            start_indexes = _get_best_indexes(result.start_logits, n_best_size)
+            end_indexes = _get_best_indexes(result.end_logits, n_best_size)
+            # if we could have irrelevant answers, get the min score of irrelevant
+            if version_2_with_negative:
+                feature_null_score = result.start_logits[0] + result.end_logits[0]
+                if feature_null_score < score_null:
+                    score_null = feature_null_score
+                    min_null_feature_index = feature_index
+                    null_start_logit = result.start_logits[0]
+                    null_end_logit = result.end_logits[0]
+            for start_index in start_indexes:
+                for end_index in end_indexes:
+                    # We could hypothetically create invalid predictions, e.g., predict
+                    # that the start of the span is in the question. We throw out all
+                    # invalid predictions.
+                    if start_index >= len(feature.tokens):
+                        continue
+                    if end_index >= len(feature.tokens):
+                        continue
+                    if start_index not in feature.token_to_orig_map:
+                        continue
+                    if end_index not in feature.token_to_orig_map:
+                        continue
+                    if not feature.token_is_max_context.get(start_index, False):
+                        continue
+                    if end_index < start_index:
+                        continue
+                    length = end_index - start_index + 1
+                    if length > max_answer_length:
+                        continue
+                    prelim_predictions.append(
+                        _PrelimPrediction(
+                            feature_index=feature_index,
+                            start_index=start_index,
+                            end_index=end_index,
+                            start_logit=result.start_logits[start_index],
+                            end_logit=result.end_logits[end_index]))
+        if version_2_with_negative:
+            prelim_predictions.append(
+                _PrelimPrediction(
+                    feature_index=min_null_feature_index,
+                    start_index=0,
+                    end_index=0,
+                    start_logit=null_start_logit,
+                    end_logit=null_end_logit))
         prelim_predictions = sorted(
-                            prelim_predictions,
-                            key=lambda x: (x.start_logit + x.end_logit),
-                            reverse=True)
-        if args.version_2_with_negative:
-            score = result.start_logits[0] + result.end_logits[0]
-            if score < null_vals[ex.qas_id][0]:
-                null_vals[ex.qas_id] = (score, result.start_logits[0], result.end_logits[0])
+            prelim_predictions,
+            key=lambda x: (x.start_logit + x.end_logit),
+            reverse=True)
 
-        curr_predictions = []
-        seen_predictions = []
+        _NbestPrediction = collections.namedtuple(  # pylint: disable=invalid-name
+            "NbestPrediction", ["text", "start_logit", "end_logit"])
+
+        seen_predictions = {}
+        nbest = []
         for pred in prelim_predictions:
-            if len(curr_predictions) == args.n_best_size:
+            if len(nbest) >= n_best_size:
                 break
-            if pred.start_index > 0:  # this is a non-null prediction TODO: this probably is irrelevant
-                final_text = get_answer_text(ex, feat, pred, args)
+            feature = features[pred.feature_index]
+            if pred.start_index > 0:  # this is a non-null prediction
+                tok_tokens = feature.tokens[pred.start_index:(pred.end_index + 1)]
+                orig_doc_start = feature.token_to_orig_map[pred.start_index]
+                orig_doc_end = feature.token_to_orig_map[pred.end_index]
+                orig_tokens = example.doc_tokens[orig_doc_start:(orig_doc_end + 1)]
+                tok_text = " ".join(tok_tokens)
+
+                # De-tokenize WordPieces that have been split off.
+                tok_text = tok_text.replace(" ##", "")
+                tok_text = tok_text.replace("##", "")
+
+                # Clean whitespace
+                tok_text = tok_text.strip()
+                tok_text = " ".join(tok_text.split())
+                orig_text = " ".join(orig_tokens)
+
+                final_text = get_final_text(tok_text, orig_text, do_lower_case, verbose_logging)
                 if final_text in seen_predictions:
                     continue
+
+                seen_predictions[final_text] = True
             else:
                 final_text = ""
+                seen_predictions[final_text] = True
 
-            seen_predictions.append(final_text)
-            curr_predictions.append(Prediction(final_text, pred.start_logit, pred.end_logit))
-        predictions[ex.qas_id] += curr_predictions
+            nbest.append(
+                _NbestPrediction(
+                    text=final_text,
+                    start_logit=pred.start_logit,
+                    end_logit=pred.end_logit))
+        # if we didn't include the empty option in the n-best, include it
+        if version_2_with_negative:
+            if "" not in seen_predictions:
+                nbest.append(
+                    _NbestPrediction(
+                        text="",
+                        start_logit=null_start_logit,
+                        end_logit=null_end_logit))
 
-    #Add empty prediction
-    if args.version_2_with_negative:
-        for qas_id in predictions.keys():
-            predictions[qas_id].append(Prediction('',
-                                                  null_vals[ex.qas_id][1],
-                                                  null_vals[ex.qas_id][2]))
+            # In very rare edge cases we could only have single null prediction.
+            # So we just create a nonce prediction in this case to avoid failure.
+            if len(nbest) == 1:
+                nbest.insert(0,
+                             _NbestPrediction(text="empty", start_logit=0.0, end_logit=0.0))
 
+        # In very rare edge cases we could have no valid predictions. So we
+        # just create a nonce prediction in this case to avoid failure.
+        if not nbest:
+            nbest.append(
+                _NbestPrediction(text="empty", start_logit=0.0, end_logit=0.0))
 
-    nbest_answers = collections.defaultdict(list)
-    answers = {}
-    for qas_id, preds in predictions.items():
-        nbest = sorted(
-                preds,
-                key=lambda x: (x.start_logit + x.end_logit),
-                reverse=True)[:args.n_best_size]
+        assert len(nbest) >= 1
 
         total_scores = []
         best_non_null_entry = None
         for entry in nbest:
             total_scores.append(entry.start_logit + entry.end_logit)
-            if not best_non_null_entry and entry.text:
-                best_non_null_entry = entry
+            if not best_non_null_entry:
+                if entry.text:
+                    best_non_null_entry = entry
+
         probs = _compute_softmax(total_scores)
+
+        nbest_json = []
         for (i, entry) in enumerate(nbest):
             output = collections.OrderedDict()
             output["text"] = entry.text
             output["probability"] = probs[i]
             output["start_logit"] = entry.start_logit
             output["end_logit"] = entry.end_logit
-            nbest_answers[qas_id].append(output)
-        if args.version_2_with_negative:
-            score_diff = null_vals[qas_id][0] - best_non_null_entry.start_logit - best_non_null_entry.end_logit
-            if score_diff > args.null_score_diff_threshold:
-                answers[qas_id] = ""
-            else:
-                answers[qas_id] = best_non_null_entry.text
+            nbest_json.append(output)
+
+        assert len(nbest_json) >= 1
+
+        if not version_2_with_negative:
+            all_predictions[example.qas_id] = nbest_json[0]["text"]
         else:
-            answers[qas_id] = nbest_answers[qas_id][0]['text']
+            # predict "" iff the null score - the score of best non-null > threshold
+            score_diff = score_null - best_non_null_entry.start_logit - (
+                best_non_null_entry.end_logit)
+            scores_diff_json[example.qas_id] = score_diff
+            if score_diff > null_score_diff_threshold:
+                all_predictions[example.qas_id] = ""
+            else:
+                all_predictions[example.qas_id] = best_non_null_entry.text
+            all_nbest_json[example.qas_id] = nbest_json
 
-    return answers, nbest_answers
+    with open(output_prediction_file, "w") as writer:
+        writer.write(json.dumps(all_predictions, indent=4) + "\n")
 
-def get_answer_text(example, feature, pred, args):
-    tok_tokens = feature.tokens[pred.start_index:(pred.end_index + 1)]
-    orig_doc_start = feature.token_to_orig_map[pred.start_index]
-    orig_doc_end = feature.token_to_orig_map[pred.end_index]
-    orig_tokens = example.doc_tokens[orig_doc_start:(orig_doc_end + 1)]
-    tok_text = " ".join(tok_tokens)
+    with open(output_nbest_file, "w") as writer:
+        writer.write(json.dumps(all_nbest_json, indent=4) + "\n")
 
-    # De-tokenize WordPieces that have been split off.
-    tok_text = tok_text.replace(" ##", "")
-    tok_text = tok_text.replace("##", "")
+    if version_2_with_negative:
+        with open(output_null_log_odds_file, "w") as writer:
+            writer.write(json.dumps(scores_diff_json, indent=4) + "\n")
 
-    # Clean whitespace
-    tok_text = tok_text.strip()
-    tok_text = " ".join(tok_text.split())
-    orig_text = " ".join(orig_tokens)
-
-    final_text = get_final_text(tok_text, orig_text, args.do_lower_case, args.verbose_logging)
-    return final_text
-
-def get_valid_prelim_predictions(start_indices, end_indices, feature, result, args):
-    
-    _PrelimPrediction = collections.namedtuple(
-        "PrelimPrediction",
-        ["start_index", "end_index", "start_logit", "end_logit"])
-    prelim_predictions = []
-    for start_index in start_indices:
-        for end_index in end_indices:
-            if start_index >= len(feature.tokens):
-                continue
-            if end_index >= len(feature.tokens):
-                continue
-            if start_index not in feature.token_to_orig_map:
-                continue
-            if end_index not in feature.token_to_orig_map:
-                continue
-            if not feature.token_is_max_context.get(start_index, False):
-                continue
-            if end_index < start_index:
-                continue
-            length = end_index - start_index + 1
-            if length > args.max_answer_length:
-                continue
-            prelim_predictions.append(
-                _PrelimPrediction(
-                    start_index=start_index,
-                    end_index=end_index,
-                    start_logit=result.start_logits[start_index],
-                    end_logit=result.end_logits[end_index]))
-    return prelim_predictions
-
-def match_results(examples, features, results):
-    unique_f_ids = set([f.unique_id for f in features])
-    unique_r_ids = set([r.unique_id for r in results])
-    matching_ids = unique_f_ids & unique_r_ids
-    features = [f for f in features if f.unique_id in matching_ids]
-    results = [r for r in results if r.unique_id in matching_ids]
-    features.sort(key=lambda x: x.unique_id)
-    results.sort(key=lambda x: x.unique_id)
-
-    for f, r in zip(features, results): #original code assumes strict ordering of examples. TODO: rewrite this
-        yield examples[f.example_index], f, r
 
 def get_final_text(pred_text, orig_text, do_lower_case, verbose_logging=False):
     """Project the tokenized prediction back to the original text."""
@@ -657,16 +734,16 @@ def get_final_text(pred_text, orig_text, do_lower_case, verbose_logging=False):
     return output_text
 
 
-def _get_best_indices(logits, n_best_size):
+def _get_best_indexes(logits, n_best_size):
     """Get the n-best logits from a list."""
     index_and_score = sorted(enumerate(logits), key=lambda x: x[1], reverse=True)
 
-    best_indices = []
+    best_indexes = []
     for i in range(len(index_and_score)):
         if i >= n_best_size:
             break
-        best_indices.append(index_and_score[i][0])
-    return best_indices
+        best_indexes.append(index_and_score[i][0])
+    return best_indexes
 
 
 def _compute_softmax(scores):
@@ -800,7 +877,7 @@ def main():
                         type=float, default=0.0,
                         help="If null_score - best_non_null is greater than the threshold predict null.")
     parser.add_argument('--vocab_file',
-                        type=str, default=None, required=True,
+                        type=str, default="vocab/vocab", required=True,
                         help="Vocabulary mapping/file BERT was pretrainined on")
     parser.add_argument("--config_file",
                         default=None,
@@ -810,7 +887,7 @@ def main():
     parser.add_argument('--log_freq',
                         type=int, default=50,
                         help='frequency of logging loss.')
-    parser.add_argument('--json-summary', type=str, default="results/dllogger.json",
+    parser.add_argument('--json-summary', type=str, default="dllogger.json",
                         help='If provided, the json summary will be written to'
                              'the specified file.')
     parser.add_argument("--eval_script",
@@ -827,19 +904,9 @@ def main():
                         default=False,
                         action='store_true',
                         help="Whether to save checkpoints")
-    parser.add_argument('--disable-progress-bar',
-                        default=False,
-                        action='store_true',
-                        help='Disable tqdm progress bar')
-    parser.add_argument("--skip_cache",
-                        default=False,
-                        action='store_true',
-                        help="Whether to cache train features")
-    parser.add_argument("--cache_dir",
-                        default=None,
-                        type=str,
-                        help="Location to cache train feaures. Will default to the dataset directory")
-
+    parser.add_argument('--save_to_s3',
+                       default=None,
+                       help='s3 bucket to save models to.')
     args = parser.parse_args()
 
     if args.use_env and 'LOCAL_RANK' in os.environ:
@@ -895,24 +962,38 @@ def main():
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and os.listdir(args.output_dir)!=['logfile.txt']:
         print("WARNING: Output directory {} already exists and is not empty.".format(args.output_dir), os.listdir(args.output_dir))
-    if not os.path.exists(args.output_dir) and is_main_process():
-        os.makedirs(args.output_dir)
+    if not os.path.exists(args.output_dir):
+        try:
+            os.makedirs(args.output_dir)
+        except:
+            print('Not sure whats up here')
 
-    tokenizer = BertTokenizer(args.vocab_file, do_lower_case=args.do_lower_case, max_len=512) # for bert large
+    try:
+        tokenizer = BertTokenizer(args.vocab_file, do_lower_case=args.do_lower_case, max_len=512) # for bert large
+    except:
+        tokenizer = BertTokenizer('/workspace/bert/vocab1', do_lower_case=args.do_lower_case, max_len=512)
     # tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
 
     train_examples = None
     num_train_optimization_steps = None
-    if args.do_train:
-        train_examples = read_squad_examples(
-            input_file=args.train_file, is_training=True, version_2_with_negative=args.version_2_with_negative)
+    if args.do_train: # first read in squad examples 
+        try:
+            train_examples = read_squad_examples(
+                input_file=args.train_file, is_training=True, version_2_with_negative=args.version_2_with_negative)
+        except:
+            print('screwing up filepath somehow')
+            train_examples = read_squad_examples(
+                input_file=args.train_file[1:-1], is_training=True, version_2_with_negative=args.version_2_with_negative)         
         num_train_optimization_steps = int(
             len(train_examples) / args.train_batch_size / args.gradient_accumulation_steps) * args.num_train_epochs
         if args.local_rank != -1:
             num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size()
 
     # Prepare model
-    config = BertConfig.from_json_file(args.config_file)
+    try:
+        config = BertConfig.from_json_file(args.config_file) 
+    except:
+        config = BertConfig.from_json_file(args.config_file[1:-1])
     # Padding for divisibility by 8
     if config.vocab_size % 8 != 0:
         config.vocab_size += 8 - (config.vocab_size % 8)
@@ -924,8 +1005,6 @@ def main():
     model.load_state_dict(torch.load(args.init_checkpoint, map_location='cpu')["model"], strict=False)
     dllogger.log(step="PARAMETER", data={"loaded_checkpoint": True})
     model.to(device)
-    num_weights = sum([p.numel() for p in model.parameters() if p.requires_grad])
-    dllogger.log(step="PARAMETER", data={"model_weights_num":num_weights})
 
     # Prepare optimizer
     param_optimizer = list(model.named_parameters())
@@ -971,22 +1050,15 @@ def main():
             raise ImportError(
                 "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
 
-        model = DDP(model)
+        model = DDP(model) # apparently can just wrap the model in DDP just like torch 
     elif n_gpu > 1:
         model = torch.nn.DataParallel(model)
 
     global_step = 0
     if args.do_train:
-
-        if args.cache_dir is None:
-            cached_train_features_file = args.train_file + '_{0}_{1}_{2}_{3}'.format(
-                list(filter(None, args.bert_model.split('/'))).pop(), str(args.max_seq_length), str(args.doc_stride),
-                str(args.max_query_length))
-        else:
-            cached_train_features_file = args.cache_dir.strip('/') + '/' + args.train_file.split('/')[-1] + '_{0}_{1}_{2}_{3}'.format(
-                list(filter(None, args.bert_model.split('/'))).pop(), str(args.max_seq_length), str(args.doc_stride),
-                str(args.max_query_length))
-
+        cached_train_features_file = args.train_file + '_{0}_{1}_{2}_{3}'.format(
+            list(filter(None, args.bert_model.split('/'))).pop(), str(args.max_seq_length), str(args.doc_stride),
+            str(args.max_query_length))
         train_features = None
         try:
             with open(cached_train_features_file, "rb") as reader:
@@ -999,12 +1071,10 @@ def main():
                 doc_stride=args.doc_stride,
                 max_query_length=args.max_query_length,
                 is_training=True)
-
-            if not args.skip_cache and is_main_process():
+            if args.local_rank == -1 or is_main_process():
                 dllogger.log(step="PARAMETER", data={"Cached_train features_file": cached_train_features_file})
                 with open(cached_train_features_file, "wb") as writer:
                     pickle.dump(train_features, writer)
-
         dllogger.log(step="PARAMETER", data={"train_start": True})
         dllogger.log(step="PARAMETER", data={"training_samples": len(train_examples)})
         dllogger.log(step="PARAMETER", data={"training_features": len(train_features)})
@@ -1028,7 +1098,7 @@ def main():
         final_loss = None
         train_start = time.time()
         for epoch in range(int(args.num_train_epochs)):
-            train_iter = tqdm(train_dataloader, desc="Iteration", disable=args.disable_progress_bar) if is_main_process() else train_dataloader
+            train_iter = tqdm(train_dataloader, desc="Iteration") if is_main_process() else train_dataloader
             for step, batch in enumerate(train_iter):
                 # Terminate early for benchmarking
                 
@@ -1038,21 +1108,7 @@ def main():
                 if n_gpu == 1:
                     batch = tuple(t.to(device) for t in batch)  # multi-gpu does scattering it-self
                 input_ids, input_mask, segment_ids, start_positions, end_positions = batch
-                start_logits, end_logits = model(input_ids, segment_ids, input_mask)
-                # If we are on multi-GPU, split add a dimension
-                if len(start_positions.size()) > 1:
-                    start_positions = start_positions.squeeze(-1)
-                if len(end_positions.size()) > 1:
-                    end_positions = end_positions.squeeze(-1)
-                # sometimes the start/end positions are outside our model inputs, we ignore these terms
-                ignored_index = start_logits.size(1)
-                start_positions.clamp_(0, ignored_index)
-                end_positions.clamp_(0, ignored_index)
-
-                loss_fct = torch.nn.CrossEntropyLoss(ignore_index=ignored_index)
-                start_loss = loss_fct(start_logits, start_positions)
-                end_loss = loss_fct(end_logits, end_positions)
-                loss = (start_loss + end_loss) / 2
+                loss = model(input_ids, segment_ids, input_mask, start_positions, end_positions)
                 if n_gpu > 1:
                     loss = loss.mean()  # mean() to average on multi-gpu.
                 if args.gradient_accumulation_steps > 1:
@@ -1084,8 +1140,15 @@ def main():
     if args.do_train and is_main_process() and not args.skip_checkpoint:
         # Save a trained model and the associated configuration
         model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
-        output_model_file = os.path.join(args.output_dir, WEIGHTS_NAME)
+        output_model_file = os.path.join(args.output_dir, 'model.pth')
         torch.save({"model":model_to_save.state_dict()}, output_model_file)
+        with tarfile.open('model.tar.gz', 'w:gz') as f:
+            f.add(output_model_file)        # this isn't working for some reason. 
+        if args.save_to_s3:
+            #os.system(f'aws s3 cp {output_model_file} {args.save_to_s3}')
+            s3_client = boto3.client('s3')
+            s3_client.upload_file('model.tar.gz',args.save_to_s3, 'model.tar.gz')
+            
         output_config_file = os.path.join(args.output_dir, CONFIG_NAME)
         with open(output_config_file, 'w') as f:
             f.write(model_to_save.config.to_json_string())
@@ -1104,7 +1167,6 @@ def main():
             doc_stride=args.doc_stride,
             max_query_length=args.max_query_length,
             is_training=False)
-
         dllogger.log(step="PARAMETER", data={"infer_start": True})
         dllogger.log(step="PARAMETER", data={"eval_samples": len(eval_examples)})
         dllogger.log(step="PARAMETER", data={"eval_features": len(eval_features)})
@@ -1123,7 +1185,7 @@ def main():
         model.eval()
         all_results = []
         dllogger.log(step="PARAMETER", data={"eval_start": True})
-        for input_ids, input_mask, segment_ids, example_indices in tqdm(eval_dataloader, desc="Evaluating", disable=args.disable_progress_bar):
+        for input_ids, input_mask, segment_ids, example_indices in tqdm(eval_dataloader, desc="Evaluating"):
             if len(all_results) % 1000 == 0:
                 dllogger.log(step="PARAMETER", data={"sample_number": len(all_results)})
             input_ids = input_ids.to(device)
@@ -1143,19 +1205,12 @@ def main():
         time_to_infer = time.time() - infer_start
         output_prediction_file = os.path.join(args.output_dir, "predictions.json")
         output_nbest_file = os.path.join(args.output_dir, "nbest_predictions.json")
-
-        answers, nbest_answers = get_answers(eval_examples, eval_features, all_results, args)
-        with open(output_prediction_file, "w") as f:
-            f.write(json.dumps(answers, indent=4) + "\n")
-        with open(output_nbest_file, "w") as f:
-            f.write(json.dumps(nbest_answers, indent=4) + "\n")
-
-        # output_null_log_odds_file = os.path.join(args.output_dir, "null_odds.json")
-        # write_predictions(eval_examples, eval_features, all_results,
-        #                   args.n_best_size, args.max_answer_length,
-        #                   args.do_lower_case, output_prediction_file,
-        #                   output_nbest_file, output_null_log_odds_file, args.verbose_logging,
-        #                   args.version_2_with_negative, args.null_score_diff_threshold)
+        output_null_log_odds_file = os.path.join(args.output_dir, "null_odds.json")
+        write_predictions(eval_examples, eval_features, all_results,
+                          args.n_best_size, args.max_answer_length,
+                          args.do_lower_case, output_prediction_file,
+                          output_nbest_file, output_null_log_odds_file, args.verbose_logging,
+                          args.version_2_with_negative, args.null_score_diff_threshold)
 
         if args.do_eval and is_main_process():
             import sys
